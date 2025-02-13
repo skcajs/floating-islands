@@ -1,0 +1,117 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+#include "shader_structures.glsl"
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uDepth;
+layout(set = 0, binding = 1) uniform texture2D uUvNrm;
+layout(set = 0, binding = 2, r16f) writeonly uniform restrict image2D uDst;
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS AND UBOs ########################
+layout(push_constant) uniform PushConstantsForSsao {
+	float mSampleRadius;
+	float mDarkeningFactor;
+	int mNumSamples;
+} pushConstants;
+
+// Uniform buffer "uboMatricesAndUserInput", containing camera matrices and user input
+layout(set = 1, binding = 0) uniform UniformBlock { matrices_and_user_input uboMatricesAndUserInput; };
+
+layout(set = 2, binding = 0) uniform RandomSamplesBlock
+{
+	vec4 uOffset[128];
+} uboRandomSamples;
+
+layout(set = 3, binding = 0) uniform NoiseBlock
+{
+	vec4 uNoise[64];
+} uboNoise;
+
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+float get_z(ivec2 iuv)
+{
+	iuv = clamp(iuv, ivec2(0,0), textureSize(uDepth, 0) - 1);
+	vec2 uv = vec2(iuv) / textureSize(uDepth, 0);
+	float depth = texelFetch(uDepth, iuv, 0).r;
+	
+	vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1);
+	vec4 viewSpace = uboMatricesAndUserInput.mInverseProjMatrix * clipSpace;
+	return viewSpace.z / viewSpace.w;
+}
+// Reconstruct position from depth buffer. Result is in view space.
+vec3 get_position(ivec2 iuv)
+{
+	iuv = clamp(iuv, ivec2(0,0), textureSize(uDepth, 0) - 1);
+	vec2 uv = vec2(iuv) / textureSize(uDepth, 0);
+	float depth = texelFetch(uDepth, iuv, 0).r;
+	
+	vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1);
+	vec4 viewSpace = uboMatricesAndUserInput.mInverseProjMatrix * clipSpace;
+	return viewSpace.xyz / viewSpace.w;
+}
+// -------------------------------------------------------
+
+// ################## COMPUTE SHADER MAIN ###################
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	// 
+	// TODO Task 1: Improve the quality of the given Screen Space Ambient Occlusion implementation!
+	//
+
+	ivec2 iuv = ivec2(gl_GlobalInvocationID.xy);
+
+	vec3 randomVec = uboNoise.uNoise[(iuv.x % 8) * 8 + (iuv.y % 8)].xyz;
+
+	vec2 nrm = texelFetch(uUvNrm, iuv, 0).zw;
+	float cosTheta = cos(nrm.x); 
+	float cosPhi = cos(nrm.y);
+	float sinTheta = sin(nrm.x);
+	float sinPhi = sin(nrm.y);
+	if (nrm.x == 0 && nrm.y == 0) {
+		imageStore(uDst, iuv, vec4(1.0));
+		return;
+	}
+	vec3 normal = vec3(cosTheta*cosPhi, sinTheta*cosPhi, sinPhi);
+
+    vec3 tangent = normalize(randomVec - normal * dot(randomVec, normal));
+    vec3 bitangent = cross(normal, tangent);
+    mat3 TBN = mat3(tangent, bitangent, normal);
+
+	vec3 pos = get_position(iuv);
+	float pos_abs_depth = -pos.z; // technically also: - near plane
+
+	float accessibility = 0.0;
+	for (int i = 0; i < pushConstants.mNumSamples; ++i)
+	{
+        vec3 offset = TBN * uboRandomSamples.uOffset[i].xyz;
+		vec3 sample_pos = pos + offset * pushConstants.mSampleRadius;
+		float sample_abs_depth = -sample_pos.z; // technically also: - near plane
+
+		// back to screen space:
+		vec4 sample_cs = uboMatricesAndUserInput.mProjMatrix * vec4(sample_pos, 1);
+		sample_cs.xy /= sample_cs.w;
+		ivec2 sample_iuv = ivec2((sample_cs.xy * 0.5 + 0.5) * textureSize(uDepth, 0));
+
+		float geometry_lin_depth = -get_z(sample_iuv); // technically also: - near plane
+		float contribution = geometry_lin_depth > sample_abs_depth ? 1.0 : 0.0;
+		float depth_out_of_range = clamp((pos_abs_depth - geometry_lin_depth) / geometry_lin_depth, 0, 1);
+		contribution = mix(contribution, 0.1, depth_out_of_range);
+		accessibility += contribution;
+	}
+	
+	float ao = (accessibility / pushConstants.mNumSamples);
+	
+	// Apply a scaling factor to make SSAO darker
+	ao = pow(ao, pushConstants.mDarkeningFactor);
+	ao = max(ao, 0.1);
+	ao = clamp(ao, 0.0, 1.0);
+
+    imageStore(uDst, iuv, vec4(ao, ao, ao, 1.0));
+}
+// -------------------------------------------------------
+

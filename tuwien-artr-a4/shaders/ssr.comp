@@ -1,0 +1,137 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+#include "shader_structures.glsl"
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uSrcDepth;
+layout(set = 0, binding = 1) uniform texture2D uSrcUvNrm;
+layout(set = 0, binding = 2) uniform utexture2D uSrcMatId;
+layout(set = 0, binding = 3) uniform texture2D uSrcColor;
+layout(set = 2, binding = 0, r16f) writeonly uniform restrict image2D uDstReflection;
+// -------------------------------------------------------
+
+// ###### USER INPUT AND MATRICES ########################
+// Uniform buffer "uboMatricesAndUserInput", containing camera matrices and user input
+layout (set = 1, binding = 0) uniform UniformBlock { matrices_and_user_input uboMatricesAndUserInput; };
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS AND UBOs ########################
+layout(push_constant) uniform PushConstantsForSsr {
+	int mMaxSteps;
+	float mStepSize;
+	float mEpsilon;
+} pushConstants;
+
+// ###### HELPER FUNCTIONS ###############################
+
+// Check if the given image coordinates are inside the image's bounds
+bool is_inside_texture(ivec2 pos)
+{
+	ivec2 size = textureSize(uSrcColor, 0);
+	return pos.x >= 0 && pos.y >= 0 && pos.x < size.x && pos.y < size.y;
+}
+
+// Reconstruct position from depth buffer. Result is in view space.
+vec3 get_position(ivec2 iuv)
+{
+	iuv = clamp(iuv, ivec2(0,0), textureSize(uSrcDepth, 0) - 1);
+	vec2 uv = vec2(iuv) / textureSize(uSrcDepth, 0);
+	float depth = texelFetch(uSrcDepth, iuv, 0).r;
+	
+	vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1);
+	vec4 viewSpace = uboMatricesAndUserInput.mInverseProjMatrix * clipSpace;
+	return viewSpace.xyz / viewSpace.w;
+}
+
+// Get the normal in view space
+vec3 get_normal(ivec2 iuv)
+{
+	vec4 uvNormal = texelFetch(uSrcUvNrm, iuv, 0).rgba;
+	vec3 normalVS = vec3(cos(uvNormal.z) * cos(uvNormal.w), sin(uvNormal.z) * cos(uvNormal.w), sin(uvNormal.w));
+	return normalize(normalVS);
+}
+
+// Convert a position in NDC space to view-space
+vec3 ndc_to_vs(vec3 position_ndc)
+{
+	vec4 vs = uboMatricesAndUserInput.mInverseProjMatrix * vec4(position_ndc, 1.0);
+	return vs.xyz / vs.w;
+}
+
+// Calculate the corresponding view-space position based on given uv coordinates
+// in transformed NDC (range 0..1) and an NDC depth value
+vec3 get_pos_vs(vec2 uv, float depth)
+{
+	vec4 pos = uboMatricesAndUserInput.mInverseProjMatrix * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	return pos.xyz / pos.w;
+}
+
+// Transform the given vec3 from view-space into NDC
+vec3 vs_to_ndc(vec3 positionVS)
+{
+	vec4 hposVS = vec4(positionVS, 1.0);
+	vec4 posCS = uboMatricesAndUserInput.mProjMatrix * hposVS;
+	vec3 posNDC = posCS.xyz / posCS.w;
+	return posNDC;
+}
+
+// Transform the given NDC xy position into screen-space
+vec2 ndc_to_ss(vec2 ndc)
+{
+	return (ndc * 0.5 + 0.5) * textureSize(uSrcDepth, 0);
+}
+
+// Transform the given screen-space position into NDC xy
+vec2 ss_to_ndc(vec2 ss)
+{
+	return (ss / textureSize(uSrcDepth, 0) - 0.5) * 2.0;
+}
+// -------------------------------------------------------
+
+// ################## COMPUTE SHADER MAIN ###################
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 iuv = ivec2(gl_GlobalInvocationID.xy);
+
+	// Get the view space position at the current pixel:
+	// (This is the position where we reflect from.)
+	vec3 p0 = get_position(iuv);
+
+	// Calculate reflection vector in view space:
+	// (This is the reflection vector, reflected across the normal)
+	vec3 reflVecVS = normalize(reflect(p0, get_normal(iuv)));
+	
+	// Initialize reflection result to black:
+	imageStore(uDstReflection, iuv, vec4(0));
+
+	//
+	// TODO Task 5: Implement Screen Space Reflections and store the reflection result in uDstReflection!
+	//
+	// Hint: Based on that reflection vector, construct a ray and try to find the
+	//       reflection position in screen-space!
+	//       Once found, sample the reflected color from texture2D uSrcColor and use
+	//       it to overwrite the reflected color value in image2D uDstReflection!
+	//
+
+    vec3 positionVS = p0;
+    
+    // Raymarching
+    for (int i = 0; i < pushConstants.mMaxSteps; ++i)
+    {
+        positionVS += reflVecVS * pushConstants.mStepSize;
+        ivec2 iposSS = ivec2(ndc_to_ss(vs_to_ndc(positionVS).xy));
+
+        if (!is_inside_texture(iposSS)) break;
+        
+        if (abs(get_pos_vs(vec2(0,0), texelFetch(uSrcDepth, iposSS, 0).r).z - positionVS.z) < pushConstants.mEpsilon)
+        {
+            imageStore(uDstReflection, iuv, texelFetch(uSrcColor, iposSS, 0));
+            break;
+        }
+    }
+
+}
+// -------------------------------------------------------
+

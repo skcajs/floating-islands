@@ -1,0 +1,91 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : enable
+#include "../shader_structures.glsl"
+
+
+// ###### USER INPUT AND MATRICES ########################
+// Uniform buffer "uboMatricesAndUserInput", containing camera matrices and user input
+layout (set = 1, binding = 0) uniform UniformBlock { matrices_and_user_input uboMatricesAndUserInput; };
+// -------------------------------------------------------
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 2, binding = 0) uniform texture2D uSrcDepth;
+layout(set = 2, binding = 1) uniform texture2D uSrcUvNrm;
+layout(set = 2, binding = 2) uniform utexture2D uSrcMatId;
+layout(set = 2, binding = 3) uniform texture2D uSrcColor;
+layout(set = 3, binding = 0, r16f) writeonly uniform restrict image2D uDstReflection;
+// -------------------------------------------------------
+
+// ###### ACCELERATION STRUCTURE #########################
+layout(set = 5, binding = 0) uniform accelerationStructureEXT uTopLevelAccStructure;
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+
+// Reconstruct position from depth buffer. Result is in view space.
+vec3 get_position(ivec2 iuv)
+{
+	iuv = clamp(iuv, ivec2(0,0), textureSize(uSrcDepth, 0) - 1);
+	vec2 uv = vec2(iuv) / textureSize(uSrcDepth, 0);
+	float depth = texelFetch(uSrcDepth, iuv, 0).r;
+	
+	vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1);
+	vec4 viewSpace = uboMatricesAndUserInput.mInverseProjMatrix * clipSpace;
+	return viewSpace.xyz / viewSpace.w;
+}
+
+// Get the normal in view space
+vec3 get_normal(ivec2 iuv)
+{
+	vec4 uvNormal = texelFetch(uSrcUvNrm, iuv, 0).rgba;
+	vec3 normalVS = vec3(cos(uvNormal.z) * cos(uvNormal.w), sin(uvNormal.z) * cos(uvNormal.w), sin(uvNormal.w));
+	return normalize(normalVS);
+}
+// -------------------------------------------------------
+
+// ###### RAY PAYLOAD TO traceRayEXT #####################
+layout(location = 0) rayPayloadEXT vec3 hitMissColor;
+// -------------------------------------------------------
+
+// ###### RAY GENERATION SHADER MAIN #####################
+void main() 
+{
+	ivec2 iuv = ivec2(gl_LaunchIDEXT.xy);
+
+	// Get the view space position at the current pixel:
+	// (This is the position where we reflect from.)
+	vec3 p0 = get_position(iuv);
+
+	// Calculate reflection vector in view space:
+	// (This is the reflection vector, reflected across the normal)
+	vec3 reflVecVS = normalize(reflect(p0, get_normal(iuv)));
+
+	// Initialize reflection result to black:
+	imageStore(uDstReflection, iuv, vec4(0));
+
+	// Up until this point, everything is pretty much the same in the Screen Space Reflections shader. 
+	//
+	// TODO Bonus Task 2 RTX ON: Transform the reflection ray in the space of the acceleration structure and use it for the traceRayEXT call!
+	//                           In which space are the acceleration structure geometries stored? => Transfer the ray into the same space!
+	//                           Pass any additional matrices you might need to this shader!
+	//
+
+    uint rayFlags = gl_RayFlagsOpaqueEXT; // Everything's opaque.
+    uint cullMask = 0xff;                 // Regard everything
+    float tMin = 0.01;                    // Ray offset from start
+    float tMax = 1000.0;                  // Maximum ray length
+    traceRayEXT(
+		uTopLevelAccStructure, rayFlags, cullMask, 
+		0 /* sbtRecordOffset */, 0 /* sbtRecordStride */, 0 /* missIndex */, 
+		vec3(0.0, 0.0, 0.0) /* ray origin */, tMin, -reflVecVS, tMax, 
+		0 /* payload's layout-location */
+	);
+
+	// Store the result of the traceRayEXT call:
+	imageStore(uDstReflection, iuv, vec4(hitMissColor, 0.0));
+}
+// -------------------------------------------------------
+

@@ -1,0 +1,50 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uOcclusionFactors;
+layout(set = 0, binding = 1) uniform texture2D uDepth;
+layout(set = 0, binding = 2, r16f) writeonly uniform restrict image2D uDst;
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS #################################
+layout(push_constant) uniform PushConstantsForBlur {
+	float mSpatial;
+	float mIntensity;
+	int mKernelSize;
+} pushConstants;
+
+// -------------------------------------------------------
+
+// ################## COMPUTE SHADER MAIN ###################
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+    ivec2 iuv = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(iuv) / vec2(textureSize(uOcclusionFactors, 0));
+
+    float occlusion = texelFetch(uOcclusionFactors, iuv, 0).r;
+    float depthCenter = texelFetch(uDepth, iuv, 0).r;
+
+    float sumWeights = 0.0;
+    float sumOcclusion = 0.0;
+
+    for (int y = -pushConstants.mKernelSize; y <= pushConstants.mKernelSize; ++y) {
+        for (int x = -pushConstants.mKernelSize; x <= pushConstants.mKernelSize; ++x) {
+            ivec2 neighborIuv = iuv + ivec2(x, y);
+
+            float neighborOcclusion = texelFetch(uOcclusionFactors, neighborIuv, 0).r;
+
+            float spatialWeight = exp(-dot(vec2(x, y), vec2(x, y)) / (2.0 * pushConstants.mSpatial * pushConstants.mSpatial));
+            float intensityWeight = exp(-pow(occlusion - neighborOcclusion, 2.0) / (2.0 * pushConstants.mIntensity * pushConstants.mIntensity));
+
+            float weight = spatialWeight * intensityWeight;
+
+            sumWeights += weight;
+            sumOcclusion += neighborOcclusion * weight;
+        }
+    }
+
+    float blurredOcclusion = sumOcclusion / sumWeights;
+    imageStore(uDst, iuv, vec4(blurredOcclusion, blurredOcclusion, blurredOcclusion, 1.0));
+}

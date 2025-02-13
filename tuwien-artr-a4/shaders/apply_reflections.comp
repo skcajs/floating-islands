@@ -1,0 +1,64 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_post_depth_coverage : enable
+#include "lightsource_limits.h"
+#include "shader_structures.glsl"
+#include "custom_packing.glsl"
+
+// ###### MATERIAL DATA ##################################
+// The actual material buffer (of type MaterialGpuData):
+// It is bound to descriptor set at index 0 and
+// within the descriptor set, to binding location 0
+layout(set = 0, binding = 0) buffer Material
+{
+	MaterialGpuData materials[];
+} materialsBuffer;
+
+// Array of samplers containing all the material's images:
+// These samplers are referenced from materials by
+// index, namely by all those m*TexIndex members.
+layout(set = 0, binding = 1) uniform sampler2D textures[];
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+vec4 sample_from_specular_texture(int matIndex, vec2 uv)
+{
+	int texIndex = materialsBuffer.materials[matIndex].mSpecularTexIndex;
+	vec4 offsetTiling = materialsBuffer.materials[matIndex].mSpecularTexOffsetTiling;
+	vec2 texCoords = uv * offsetTiling.zw + offsetTiling.xy;
+	return texture(textures[texIndex], texCoords);
+}
+// -------------------------------------------------------
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 1, binding = 0) uniform texture2D uSrcDepth;
+layout(set = 1, binding = 1) uniform texture2D uSrcUvNrm;
+layout(set = 1, binding = 2) uniform utexture2D uSrcMatId;
+layout(set = 1, binding = 3) uniform texture2D uSrcColor;
+layout(set = 2, binding = 0) uniform texture2D uRefl;
+layout(set = 2, binding = 1, r16f) writeonly uniform restrict image2D uDstColor;
+// -------------------------------------------------------
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 pos          = ivec2(gl_GlobalInvocationID.xy);
+	vec4  srcColor     = texelFetch(uSrcColor, pos, 0).rgba;
+	vec3  reflection   = texelFetch(uRefl, pos, 0).rgb;
+
+	// compute specular contribution:
+	uint tmp_umatIndex;
+	vec4 tmp_ddx_ddy;
+	unpack_material_and_texture_gradients(texelFetch(uSrcMatId, pos, 0), tmp_umatIndex, tmp_ddx_ddy);
+	int matIndex = int(tmp_umatIndex);
+	vec2  uv           = texelFetch(uSrcUvNrm, pos, 0).rg;
+	float specTexValue = sample_from_specular_texture(matIndex, uv).r;
+	vec3  spec         = materialsBuffer.materials[matIndex].mSpecularReflectivity.rgb;
+	vec3  reflective   = materialsBuffer.materials[matIndex].mReflectiveColor.rgb;
+
+	// apply reflection:
+	imageStore(uDstColor, pos, vec4(srcColor.rgb - (srcColor.rgb * specTexValue * spec) + reflection * reflective, srcColor.a));
+}
+

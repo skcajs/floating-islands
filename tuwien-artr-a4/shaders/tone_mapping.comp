@@ -1,0 +1,100 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uColor;
+layout(set = 0, binding = 1, rgba8_snorm) writeonly uniform restrict image2D uDst;
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS AND SSBOs #######################
+layout(push_constant) uniform PushConstants {
+	bool mToneMappingEnabled; 
+	bool mGradualAdaption; // not used here
+	bool mUseMax;
+	float mKey;
+	float mDeltaTime;      // not used here
+} pushConstants;
+
+layout(set = 1, binding = 0) buffer LuminanceData
+{
+	float mAvgLum;
+	float mMaxLum;
+	vec2 _padding;
+} lumBuffer;
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+// see https://en.wikipedia.org/wiki/SRGB
+
+// converts linear rgb to luminance
+float rgb2y(vec3 rgb)
+{
+	return dot(vec3(0.2126, 0.7152, 0.0722), rgb);
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+float linear_to_sRGB(float linearColor)
+{
+	if (linearColor <= 0.0031308) {
+		return 12.92 * linearColor;
+	}
+	float a = 0.055;
+	return (1 + a) * pow(linearColor, 1 / 2.4) - a;
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+vec3 linear_to_sRGB(vec3 linearColor)
+{
+	vec3 srgb;
+	srgb.r = linear_to_sRGB(linearColor.r);
+	srgb.g = linear_to_sRGB(linearColor.g);
+	srgb.b = linear_to_sRGB(linearColor.b);
+	return srgb;
+}
+
+// ################## compute shader main ###################
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 iuv = ivec2(gl_GlobalInvocationID.xy);
+	vec3 inp = texelFetch(uColor, iuv, 0).rgb;
+	vec3 rgb = inp;
+
+
+	if (pushConstants.mToneMappingEnabled) {
+		float worldLuminance = rgb2y(inp);
+		//
+		// TODO Task 3: Implement Reinhard tone mapping!
+		//              lumBuffer.mAvgLum and lumBuffer.mMaxLum contain the average and maximum "world" luminance.
+		//              Use lumBuffer.mMaxLum only if pushConstants.mUseMax is true!
+		//
+		// This was VERY tricky to get right. It's probably not quite right, but I'm getting comparable results to the description.
+		float value = 1.0;
+        float scaledLuminance = pushConstants.mKey * worldLuminance / (pushConstants.mUseMax ? lumBuffer.mMaxLum : lumBuffer.mAvgLum);
+        if (pushConstants.mUseMax) {
+			// This is what I'm interpreting as "scale L_white"
+            float L_white = pushConstants.mKey / lumBuffer.mAvgLum * lumBuffer.mMaxLum;
+            value = scaledLuminance * (1 + scaledLuminance / (L_white * L_white)) / (1 + scaledLuminance);
+        } else {
+            value = scaledLuminance / (1 + scaledLuminance);
+        }
+
+		if (worldLuminance > 0.0) {
+			rgb *= value / worldLuminance;
+		}
+
+	}
+
+	// Write rgb into uDst
+	// - imageStore() cannot handle sRGB images
+	// - we write sRGB values into an RGB image and copy the image into an sRGB image later as a workaround
+	// => we have to manually convert linear RGB to sRGB
+	vec3 srgb = linear_to_sRGB(rgb);
+
+	imageStore(uDst, iuv, vec4(srgb, 1.0));
+}
+

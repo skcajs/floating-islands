@@ -1,0 +1,266 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "ibl_maps_config.h"
+#include "sphere_mapping.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D imagesampler_EnvironmentMap;
+layout(set = 0, binding = 1, ALL_IBL_MAPS_SHADERFORMAT) writeonly uniform restrict image2D outputImage;
+
+layout(push_constant) uniform PushConstansBlock {
+	int   mMapToBuild; // 0: irradiance map, 1: pre-filtered environment map, 2: brdf lookup table
+	float mRoughness;  // roughness for (the current mip level of) the pre-filtered environment map
+} pc;
+
+// ----------------------------------------------------------------------------
+// Utility functions
+// ----------------------------------------------------------------------------
+// utility function to sample the equirectangular environment map
+vec3 sample_environment_map_by_direction(vec3 aNormalizedWorldSpaceDirection) {
+	return texture(imagesampler_EnvironmentMap, sphere_map_direction_to_uv(aNormalizedWorldSpaceDirection)).rgb;
+}
+// ----------------------------------------------------------------------------
+// This is just an internal utility function used by get_pseudo_random_sample(). You can safely ignore it.
+float RadicalInverse_VdC(uint bits) 
+{
+     bits = (bits << 16u) | (bits >> 16u);
+     bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+     bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+     bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+     bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+     return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+// ----------------------------------------------------------------------------
+// return a pseudo-random sample (actually this is not random at all, but the Hammersley sequence - but this is good enough for here)
+vec2 get_pseudo_random_sample(uint i, uint N)
+{
+	return vec2(float(i)/float(N), RadicalInverse_VdC(i));
+}
+// ----------------------------------------------------------------------------
+// sample the hemisphere (around the normal [0,0,1]) uniformly
+// input: 2D random sample in range [0,1) x [0,1)
+// returns direction vector in *local* coordinates
+vec3 sample_hemisphere_uniformly(vec2 randomSample) {
+    float cosTheta = randomSample.y;
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta*cosTheta));
+
+    float sinPhi = sin(2.0 * M_PI * randomSample.x);
+    float cosPhi = cos(2.0 * M_PI * randomSample.x);
+
+    return vec3(cosPhi * sinTheta, sinPhi * sinTheta, cosTheta);
+}
+// ----------------------------------------------------------------------------
+// importance sample a halfway vector for the normal distribution function - see comments in computePrefilteredEnvironmentMap() and computeBrdfLookupTable()
+vec3 importance_sample_halfway_vector(vec2 randomSample, float roughness)
+{
+	float a = roughness*roughness;
+	
+	float phi = 2.0 * M_PI * randomSample.x;
+	float cosTheta = sqrt((1.0 - randomSample.y) / (1.0 + (a*a - 1.0) * randomSample.y));
+	float sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+	
+	float cosPhi = cos(phi);
+	float sinPhi = sin(phi);
+
+	return normalize(vec3(cosPhi * sinTheta, sinPhi * sinTheta, cosTheta));
+}
+// ----------------------------------------------------------------------------
+// convert halfway vector to light vector, given the view vector
+vec3 halfway_vector_to_light_vector(vec3 halfway, vec3 view_vector)
+{
+    return normalize(2.0 * dot(view_vector, halfway) * halfway - view_vector);
+}
+// ----------------------------------------------------------------------------
+// coordinate conversion from local hemisphere coordinates to world space coordinates
+mat3 get_local_to_world_transform(vec3 hemisphereNormalInWorldSpace) {
+    vec3 N = hemisphereNormalInWorldSpace;
+	vec3 up        = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+	vec3 tangent   = normalize(cross(up, N));
+	vec3 bitangent = cross(N, tangent);
+    return mat3(tangent, bitangent, N);
+}
+// ----------------------------------------------------------------------------
+// Calculate the G-term for IBL
+float calc_geometry_term_ibl(float roughness, float n_dot_v, float n_dot_l)
+{
+	// Calculate the G-term with a Smith/Schlick-GGX approximation
+    // k is calculated slightly different than for PBS
+	float k = roughness * roughness * 0.5;
+	float G_v = (n_dot_v / (n_dot_v * (1.0 - k) + k)); // G-term for view  (occlusion/masking)
+	float G_l = (n_dot_l / (n_dot_l * (1.0 - k) + k)); // G-term for light (shadowing)
+	float G = G_v * G_l;
+	return G;
+}
+
+// ----------------------------------------------------------------------------
+// Calculation of the three maps
+// ----------------------------------------------------------------------------
+
+// Compute the Irradiance map
+vec3 computeIrradianceMap(vec3 directionWS) {
+
+    // The Irradiance Map corresponds to the diffuse part of the Cook-Torrance BRDF
+    // What we have to compute here is:
+    //
+    // Value = PI * Integral_over_Hemisphere[ Li(w_i) (n . w_i) d w_i ]
+    // We use Monte-Carlo integration with uniform hemisphere sampling.
+    // So:
+    // Value = (1/SAMPLES) * PI * SUM( Li(w_i) (n . w_i) / probability_i )
+    // where propability_i is the probability for drawing this specific sample value.
+    //
+    // Since we use uniform sampling, all the probabilities are the same, namely:
+    //   probability_i = 1 / (2 PI)
+    // which simplifies things a lot, because we can simplify the sum like that:
+    //
+    // >>>  Value = (1/SAMPLES) * 2 *  SUM( Li(w_i) (n . w_i) )  <<<
+    //
+
+
+	// TODO Bonus Task 2:
+	// - Complete the code!
+    // - Hint: To find the incoming light Li(w_i) from a specific direction w_i, use sample_environment_map_by_direction().
+
+	vec3 N = directionWS; // the normal of the hemisphere we want to sample - equals the direction vector
+	vec3 irradiance = vec3(0.0);
+
+    mat3 local_to_world = get_local_to_world_transform(N);
+
+    const uint SAMPLE_COUNT = IRRADIANCE_MAP_NUM_SAMPLES;
+    for(uint i = 0u; i < SAMPLE_COUNT; ++i)
+    {
+        // get a random sample 
+        vec2 randomSample = get_pseudo_random_sample(i, SAMPLE_COUNT);
+        // and use it to get a random direction to (incoming) light (in local coordinates)
+        vec3 L_local = sample_hemisphere_uniformly(randomSample);
+        // convert to world-space coordinates
+        vec3 L_world = local_to_world * L_local;
+
+	    // TODO Bonus Task 2: calculate the summand and accumulate it in irradiance
+    }
+
+    // TODO Bonus Task 2: calculate the final value
+	return irradiance;
+}
+// ----------------------------------------------------------------------------
+vec3 computePrefilteredEnvironmentMap(vec3 directionWS, float roughness) {
+
+    // This is the first part of the split-sum approximation, called "Light term" in the slides (p.67+)
+    // The calculation is quite simple (see slides).
+    //
+    // However, we use importance-sampling for the split-sum approximation.
+    // This means we don't sample the hemisphere uniformly, like we did for the irradiance map,
+    // but instead choose samples in such a way they are better aligned for the reflection direction.
+    // This also means, the probability for each sample (see comment in computeIrradianceMap() ) is no longer the same.
+    // >> BUT FORTUNATELY YOU CAN IGNORE THAT HERE! <<
+    //
+    // The sample probability ("p" in the slides) only occurs in the second term of the split-sum approximation, which
+    // will be calculated separately in computeBrdfLookupTable().
+    // So you really only need to sum up the incoming light in this function.
+
+    vec3 N = directionWS;
+    
+    // make the simplyfying assumption that V equals the normal 
+    vec3 V = N;
+
+    mat3 local_to_world = get_local_to_world_transform(N);
+
+    const uint SAMPLE_COUNT = PREFILTERED_ENV_MAP_NUM_SAMPLES;
+    vec3 prefilteredColor = vec3(0.0);
+    uint samplesUsed = 0; // count the samples we actually can use (we may need to discard some)
+    
+	// TODO Bonus Task 2:
+	// - Complete the code!
+    // - Hint: Use importance_sample_halfway_vector() to get a halfway vector (do NOT use sample_hemisphere_uniformly()!)
+    //         Don't forget to transform it from local space to world-space
+    //         You can use halfway_vector_to_light_vector() to obtain the light vector you need (this is "l_j" in the slides p.68)
+    // - Hint: Your light vector may actually point to the "wrong side" of the hemisphere, if the random halfway vector is large.
+    //         So better check if (N.L) > 0 and only use the sample in that case.
+
+    for(uint j = 0u; j < SAMPLE_COUNT; ++j)
+    {
+	// TODO Bonus Task 2: accumulate the incoming light
+    }
+
+	// TODO Bonus Task 2: finish the calculation (Hint: one-liner)
+    return prefilteredColor;
+}
+// ----------------------------------------------------------------------------
+// compute the BRDF lookup table
+vec2 computeBrdfLookupTable(float n_dot_v, float roughness) {
+
+    // Here we calculate the BRDF lookup table (see slides p. 71 - 76)
+    // Especially slide 74 looks a bit daunting, but don't worry, things do simplify a lot!
+    //
+    // First of all, all our calculations here take place in the local coordinate frame of the hemisphere,
+    // so there is no need to convert anything to world-space coordinates.
+    //
+    // Like in computePrefilteredEnvironmentMap(), use the importance sampling function to get a halfway vector,
+    // and from that a light vector. And - as before - check if (N.L) > 0 before using it!
+    //
+    // Importance sampling needs a division by the sampling probability, right? Ugh!
+    // >>> BUT... YOU'RE INCREDIBLY LUCKY AGAIN! <<<
+    //
+    // One common term in the split sum approximation (slides p.74, bottom) is:
+    //
+    //     Vis * D * (n_dot_l)
+    //    ---------------------
+    //         probability
+    //
+    // With the probability of our specific importance sampling function this simplifies to:
+    //
+    //      G * (v_dot_h)
+    //    -----------------
+    //    n_dot_h * n_dot_v
+    //
+    // And to get G, you can just use the preimplemented function calc_geometry_term_ibl().
+    //
+    // The rest should be pretty straight-forward:
+    // For each sample calculate the D0-term and the D1-term, accumulate them and finally divide by the number of samples used.
+
+    // First we calculate the view vector in the local coordinate frame
+    vec3 V;
+    V.x = sqrt(1.0 - n_dot_v * n_dot_v);
+    V.y = 0.0;
+    V.z = n_dot_v;
+
+    float D0 = 0.0;
+    float D1 = 0.0; 
+
+    // All calculations here are done in the local (hemisphere) coordinate system (normal = [0,0,1])
+    vec3 N = vec3(0.0, 0.0, 1.0);
+    
+    uint samplesUsed = 0; // count the samples we actually can use (we may need to discard some)
+
+    const uint SAMPLE_COUNT = BRDF_LUT_NUM_SAMPLES;
+
+	// TODO Bonus Task 2: implement the rest of the function!
+
+    return vec2(D0, D1);
+}
+
+// ----------------------------------------------------------------------------
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 imgSize = imageSize(outputImage);
+	if (any(greaterThanEqual(pixel, imgSize))) return;
+
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(imgSize);
+	vec3 directionWS = sphere_map_uv_to_direction(uv); // already normalized
+	
+	if (pc.mMapToBuild == 0) {
+		// compute the irradiance map
+		imageStore(outputImage, pixel, vec4(computeIrradianceMap(directionWS), 1));
+	} else if (pc.mMapToBuild == 1) {
+		// compute prefiltered environment with specific roughness
+		imageStore(outputImage, pixel, vec4(computePrefilteredEnvironmentMap(directionWS, pc.mRoughness), 1));
+	} else if (pc.mMapToBuild == 2) {
+		// compute the BRDF lookup table
+		imageStore(outputImage, pixel, vec4(computeBrdfLookupTable(uv.x, uv.y), 0, 1));
+	} else {
+		// should never end up here
+		imageStore(outputImage, pixel, vec4(0));
+	}
+}
+

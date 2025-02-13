@@ -1,0 +1,30 @@
+#version 460
+
+layout(set = 0, binding = 0, rgba16f) uniform restrict image2D img;
+layout(set = 0, binding = 1, std430) writeonly buffer HoleCheckResultBuffer {
+	bool holeCheckResult;
+};
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main() {
+	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 imSize = imageSize(img);
+	if (any(greaterThanEqual(pos, imSize))) return; // abort if outside image
+	
+	vec3 color = imageLoad(img, pos).rgb;
+	if (color == vec3(1, 0, 0))
+	{
+		holeCheckResult = true;
+		int growSize = 2;
+		for (int xOffset = -growSize; xOffset <= growSize; xOffset++) for (int yOffset = -growSize; yOffset <= growSize; yOffset++)
+		{
+			ivec2 posNew = pos + ivec2(xOffset, yOffset);
+			if (all(greaterThanEqual(posNew, ivec2(0,0))) && all(lessThan(posNew, imSize))) {
+				// might overwrite red neighbor pixels which can result in flickering,
+				// but we don't care - it's good enough for debugging
+				imageStore(img, posNew, vec4(0.99, 0, 0, 1));
+			}
+		}
+	}
+}
+

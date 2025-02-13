@@ -1,0 +1,49 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uAvgLogLum;
+layout(set = 0, binding = 1) uniform texture2D uMaxLogLum;
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS AND SSBOs #######################
+layout(push_constant) uniform PushConstants {
+	bool mToneMappingEnabled; 
+	bool mGradualAdaption;
+	bool mUseMax;
+	float mKey;
+	float mDeltaTime;
+	float mAdaptationSpeed;
+} pushConstants;
+
+layout(set = 1, binding = 0) buffer LuminanceData
+{
+	float mAvgLum;
+	float mMaxLum;
+	vec2 _padding;
+} ssbo;
+// -------------------------------------------------------
+
+// ################## compute shader main ###################
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+	// 
+	// TODO Task 4: Implement some sort of gradual adaption for avgLum and maxLum!
+	//              (if pushConstants.mGradualAdaption is true)
+	//              Feel free to adapt the storag buffer according to your needs.
+	//
+	float newAvgLum = exp(texelFetch(uAvgLogLum, ivec2(0, 0), 0).r);
+	float newMaxLum = exp(texelFetch(uMaxLogLum, ivec2(0, 0), 0).r);
+
+    if (pushConstants.mGradualAdaption) {
+        ssbo.mAvgLum = mix(ssbo.mAvgLum, newAvgLum, 1.0 - exp(-pushConstants.mAdaptationSpeed * pushConstants.mDeltaTime));
+        ssbo.mMaxLum = mix(ssbo.mMaxLum, newMaxLum, 1.0 - exp(-pushConstants.mAdaptationSpeed * pushConstants.mDeltaTime));
+    } else {
+        ssbo.mAvgLum = newAvgLum;
+        ssbo.mMaxLum = newMaxLum;
+    }
+}
+

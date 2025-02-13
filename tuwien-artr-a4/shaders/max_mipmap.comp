@@ -1,0 +1,42 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uLargerTex;
+layout(set = 0, binding = 1, r16f) writeonly uniform restrict image2D uSmallerTex;
+// -------------------------------------------------------
+
+// ################## compute shader main ###################
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 largerSize = textureSize(uLargerTex, 0);
+	ivec2 posSmaller = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 posLarger = posSmaller * 2;
+	float outp = texelFetch(uLargerTex, posLarger, 0).r;
+
+	// if neighbor pixel exists, include it
+	if (largerSize.x > 1)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(1, 0), 0).r);
+	if (largerSize.y > 1)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(0, 1), 0).r);
+	if (largerSize.x > 1 && largerSize.y > 1)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(1, 1), 0).r);
+
+	// if current pixel is border, but larger image is 1 pixel bigger, include additional neighbors
+	if (posLarger.x == largerSize.x - 3)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(2, 0), 0).r);
+	if (posLarger.x == largerSize.x - 3 && largerSize.y > 1)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(2, 1), 0).r);
+	if (posLarger.y == largerSize.y - 3)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(0, 2), 0).r);
+	if (posLarger.y == largerSize.y - 3 && largerSize.x > 1)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(1, 2), 0).r);
+	if (posLarger.x == largerSize.x - 3 && posLarger.y == largerSize.y - 3)
+		outp = max(outp, texelFetch(uLargerTex, posLarger + ivec2(2, 2), 0).r);
+
+	imageStore(uSmallerTex, posSmaller, vec4(outp, 0.0, 0.0, 0.0));
+}
+

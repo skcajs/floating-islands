@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uSrcColor;
+layout(set = 0, binding = 1) uniform texture2D uOccFactor;
+layout(set = 0, binding = 2, r16f) writeonly uniform restrict image2D uDstColor;
+// -------------------------------------------------------
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+	vec3 srcColor = texelFetch(uSrcColor, pos, 0).rgb;
+	vec3 occFactor = texelFetch(uOccFactor, pos, 0).rgb;
+	imageStore(uDstColor, pos, vec4(srcColor * occFactor, 1.0));
+}
+

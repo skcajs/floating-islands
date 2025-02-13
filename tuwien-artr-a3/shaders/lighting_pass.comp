@@ -1,0 +1,414 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+#include "lightsource_limits.h"
+#include "shader_structures.glsl"
+
+#define WORKGROUP_SIZE 16
+
+shared uint visibleLightCount;
+shared uint visibleLightIndices[1024];
+
+// ###### PIPELINE INPUT DATA ############################
+// Unique push constants per draw call; using a different definition for comute shaders here:
+struct PushConstantsForDispatch {
+	int   mSampleCount;
+};
+layout(push_constant) uniform PushConstantsBlock { PushConstantsForDispatch pushConstants; };
+
+// Uniform buffer "uboMatricesAndUserInput", containing camera matrices and user input
+layout (set = 0, binding = 0) uniform UniformBlock { matrices_and_user_input uboMatricesAndUserInput; };
+
+// "mLightsources" uniform buffer containing all the light source data:
+layout(set = 0, binding = 1) uniform LightsourceData
+{
+	// x,y ... ambient light sources start and end indices; z,w ... directional light sources start and end indices
+	uvec4 mRangesAmbientDirectional;
+	// x,y ... point light sources start and end indices; z,w ... spot light sources start and end indices
+	uvec4 mRangesPointSpot;
+	// Contains all the data of all the active light sources
+	LightsourceGpuData mLightData[MAX_NUMBER_OF_LIGHTSOURCES];
+} uboLights;
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+
+// Converts sRGB color values into linear space:
+// Apply this after reading colors from textures.
+float sRGB_to_linear(float srgbColor)
+{
+    if (srgbColor <= 0.04045) {
+		return srgbColor / 12.92;
+	}
+    return pow((srgbColor + 0.055) / (1.055), 2.4);
+}
+
+// Converts sRGB color values into linear space:
+// Apply this after reading colors from textures.
+vec3 sRGB_to_linear(vec3 srgbColor)
+{
+	vec3 linear;
+	linear.r = sRGB_to_linear(srgbColor.r);
+	linear.g = sRGB_to_linear(srgbColor.g);
+	linear.b = sRGB_to_linear(srgbColor.b);
+	return linear;
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+float linear_to_sRGB(float linearColor)
+{
+	if (linearColor <= 0.0031308) {
+		return 12.92 * linearColor;
+	}
+	float a = 0.055;
+	return (1 + a) * pow(linearColor, 1 / 2.4) - a;
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+vec3 linear_to_sRGB(vec3 linearColor)
+{
+	vec3 srgb;
+	srgb.r = linear_to_sRGB(linearColor.r);
+	srgb.g = linear_to_sRGB(linearColor.g);
+	srgb.b = linear_to_sRGB(linearColor.b);
+	return srgb;
+}
+
+//
+// TODO Task 5: Feel free to use the helper function create_plane(vec3,vec3,float) to create planes to 
+//              describe a view frustum! Create one such frustum per (e.g.) 16x16 tile and then cull 
+//              every light source with that frustum -- feel free to use  get_distance_from_plane(vec3,vec4) 
+//              for that purpose!
+//              
+// Note: You don't have to use 16x16 tiles. Please feel free to use different tile sizes!
+//       Please report all interesting research findings that you encounter from different 
+//       parameters/approaches/tile sizes with us through the readme file!
+//
+
+/**	Create a plane in Hessian normal form from two direction vectors and a distance from the origin.
+ *  @param	direction1			First  direction vector, which serves as the first  parameter to the cross product
+ *  @param	direction2			Second direction vector, which serves as the second parameter to the cross product
+ *  @param	distanceFromOrigin	A parameter which specifies the distance of the origin of the coordinate system in the
+ *								direction of the computed normal vector, which is computed as cross(drection1, direction2)
+ */
+vec4 create_plane(vec3 direction1, vec3 direction2, float distanceFromOrigin)
+{ 
+    vec4 plane;
+    plane.xyz = normalize(cross(direction1, direction2));
+    plane.w = distanceFromOrigin;
+    return plane;
+}
+
+void compute_tile_frustum_planes(uvec2 tileID, vec2 screenSize, float minDepth, float maxDepth, out vec4 planes[6])
+{
+	vec2 tileMax = vec2(tileID) * vec2(WORKGROUP_SIZE); // Top left
+	vec2 tileMin = vec2(tileMax) + vec2(WORKGROUP_SIZE) - vec2(1); // Bottom right
+
+	vec2 ndcTileMax = (tileMax / screenSize) * 2 - 1;
+	vec2 ndcTileMin = (tileMin / screenSize) * 2 - 1;
+
+	vec4 tileMaxT = uboMatricesAndUserInput.mInverseProjMatrix * vec4(ndcTileMax, 1.0, 1.0);
+	vec4 tileMinT = uboMatricesAndUserInput.mInverseProjMatrix * vec4(ndcTileMin, 1.0, 1.0);
+
+	vec3 tileMaxVS = tileMaxT.rgb / tileMaxT.w;
+	vec3 tileMinVS = tileMinT.rgb / tileMaxT.w;
+
+	// To construct the planes:
+	vec3 X = vec3(1, 0, 0), Y = vec3(0, 1, 0), Z = vec3(0, 0, 1);
+
+	planes[0] = create_plane(-X, tileMinVS, 0); // Left
+	planes[1] = create_plane( X, tileMaxVS, 0); // Right
+	planes[2] = create_plane(-Y, tileMinVS, 0); // Bottom
+	planes[3] = create_plane( Y, tileMaxVS, 0); // Top
+	planes[4] = vec4( Z, -minDepth); // Near
+	planes[5] = vec4(-Z, -maxDepth); // Far
+}
+
+/**	Compute the distance of a given point to a given plane
+ *	@param	point		Point to compute the distance to the plane for
+ *	@param	plane		Plane in Hessian normal form
+ */
+float get_distance_from_plane(vec3 point, vec4 plane)
+{
+    return dot(plane.xyz, point.xyz) - plane.w;
+}
+
+//
+// TODO Task 5: Feel free to use the helper function estimate_radius_of_influence(vec3,vec3) to 
+//              get an estimate of the radius of influence of a given point light source! 
+//              Should you decide to use a different approach to compute the radius of influence 
+//              of a light source, that's perfectly fine, too. 
+//              Please describe in the readme file, which approach you hae taken!
+//
+// Note: This function applies to spot lights, too, but the range of spot lights could be further 
+//       optimized by taking their direction and angle into account.
+//
+
+/**	Compute an estimation for the radius of influence of a given point light source, 
+ *  i.e., a radius from where on a point light's influence is barely noticeable anymore. 
+ *  @param	lightSourceColor		The light color of the given light source 
+ *	@param	lightSourceAttenuation	The attenuation of the given light source 
+ */
+float estimate_radius_of_influence(vec3 lightSourceColor, vec3 lightSourceAttenuation) 
+{
+	float denom = max(0.0001, (2.0 * lightSourceAttenuation.z));
+	float C = max(lightSourceColor.x, max(lightSourceColor.y, lightSourceColor.z));
+	float inSqrt = max(0.0, lightSourceAttenuation.y * lightSourceAttenuation.y - 4.0 * lightSourceAttenuation.z * (lightSourceAttenuation.x - 256.0 * C));
+	float d1 = (-lightSourceAttenuation.y + sqrt(inSqrt)) / denom;
+	float d2 = (-lightSourceAttenuation.y - sqrt(inSqrt)) / denom;
+	return max(abs(d1), abs(d2));
+}
+
+bool intersects(LightsourceGpuData light, vec4 planes[6]) {
+	float radius = estimate_radius_of_influence(light.mColor.rgb, light.mAttenuation.rgb);
+
+	if ( // Want to test intersection from all sides.
+		get_distance_from_plane(light.mPosition.xyz, planes[0]) < radius &&
+	    get_distance_from_plane(light.mPosition.xyz, planes[1]) < radius && 
+		get_distance_from_plane(light.mPosition.xyz, planes[2]) < radius && 
+		get_distance_from_plane(light.mPosition.xyz, planes[3]) < radius && 
+		get_distance_from_plane(light.mPosition.xyz, planes[4]) < radius && 
+		get_distance_from_plane(light.mPosition.xyz, planes[5]) < radius ) return true;
+
+	return false;
+}
+
+// Calculates the light attenuation dividend for the given attenuation vector.
+// @param atten attenuation data
+// @param dist  distance
+// @param dist2 squared distance
+float calc_attenuation(vec4 atten, float dist, float dist2)
+{
+	return atten[0] + atten[1] * dist + atten[2] * dist2;
+}
+
+// Calculates the diffuse and specular illumination contribution for the given
+// parameters according to the Blinn-Phong lighting model.
+// All parameters must be normalized.
+vec3 calc_blinn_phong_contribution(vec3 toLight, vec3 toEye, vec3 normal, vec3 diffFactor, vec3 specFactor, float specShininess)
+{
+	float nDotL = max(0.0, dot(normal, toLight)); // lambertian coefficient
+	vec3 h = normalize(toLight + toEye);
+	float nDotH = max(0.0, dot(normal, h));
+	float specPower = pow(nDotH, specShininess);
+
+	vec3 diffuse = diffFactor * nDotL; // component-wise product
+	vec3 specular = specFactor * specPower;
+
+	return diffuse + specular;
+}
+
+// Calculates the diffuse and specular illumination contribution for all the light sources.
+// All calculations are performed in view space
+vec3 calc_illumination_in_vs(vec3 posVS, vec3 normalVS, vec3 diff, vec3 spec, float shini)
+{
+	vec3 diffAndSpec = vec3(0.0, 0.0, 0.0);
+
+	// Calculate shading in view space since all light parameters are passed to the shader in view space
+	vec3 eyePosVS = vec3(0.0, 0.0, 0.0);
+	vec3 toEyeNrmVS = normalize(eyePosVS - posVS);
+
+	// Directional lights:
+	for (uint i = uboLights.mRangesAmbientDirectional[2]; i < uboLights.mRangesAmbientDirectional[3]; ++i) {
+		vec3 toLightDirVS = normalize(-uboLights.mLightData[i].mDirection.xyz);
+		vec3 dirLightIntensity = uboLights.mLightData[i].mColor.rgb;
+		diffAndSpec += dirLightIntensity * calc_blinn_phong_contribution(toLightDirVS, toEyeNrmVS, normalVS, diff, spec, shini);
+	}
+
+	// Point lights:
+	for (uint i = 0; i < visibleLightCount; ++i)
+	{
+		uint idx = visibleLightIndices[i];
+		vec3 lightPosVS = uboLights.mLightData[idx].mPosition.xyz;
+		vec3 toLight = lightPosVS - posVS;
+		float distSq = dot(toLight, toLight);
+		float dist = sqrt(distSq);
+		vec3 toLightNrm = toLight / dist;
+
+		float atten = calc_attenuation(uboLights.mLightData[idx].mAttenuation, dist, distSq);
+		vec3 intensity = uboLights.mLightData[idx].mColor.rgb / atten;
+
+		diffAndSpec += intensity * calc_blinn_phong_contribution(toLightNrm, toEyeNrmVS, normalVS, diff, spec, shini);
+	}
+
+	// spot lights
+	for (uint i = uboLights.mRangesPointSpot[2]; i < uboLights.mRangesPointSpot[3]; ++i)
+	{
+		vec3 lightPosVS = uboLights.mLightData[i].mPosition.xyz;
+		vec3 toLight = lightPosVS - posVS;
+		float distSq = dot(toLight, toLight);
+		float dist = sqrt(distSq);
+		vec3 toLightNrm = toLight / dist;
+
+		float atten = calc_attenuation(uboLights.mLightData[i].mAttenuation, dist, distSq);
+		vec3 intensity = uboLights.mLightData[i].mColor.rgb / atten;
+
+		vec3 dirVS = uboLights.mLightData[i].mDirection.xyz;
+		float cosOfHalfOuter = uboLights.mLightData[i].mAnglesFalloff[0];
+		float cosOfHalfInner = uboLights.mLightData[i].mAnglesFalloff[1];
+		float falloff = uboLights.mLightData[i].mAnglesFalloff[2];
+		float cosAlpha = dot(-toLightNrm, dirVS);
+		float da = cosAlpha - cosOfHalfOuter;
+		float fade = cosOfHalfInner - cosOfHalfOuter;
+		intensity *= da <= 0.0 ? 0.0 : pow(min(1.0, da / max(0.0001, fade)), falloff);
+
+		diffAndSpec += intensity * calc_blinn_phong_contribution(toLightNrm, toEyeNrmVS, normalVS, diff, spec, shini);
+	}
+
+	return diffAndSpec;
+}
+
+// ###### SRC/DST IMAGES #################################
+layout (set = 1, binding = 0) uniform texture2DMS iColor;
+layout (set = 1, binding = 1) uniform texture2DMS iDepth;
+layout (set = 1, binding = 2) uniform texture2DMS iNormal;
+layout (set = 1, binding = 3) uniform texture2DMS iAmbient;
+layout (set = 1, binding = 4) uniform texture2DMS iEmissive;
+layout (set = 1, binding = 5) uniform texture2DMS iDiffuse;
+layout (set = 1, binding = 6) uniform texture2DMS iSpecular;
+layout (set = 1, binding = 7) uniform texture2DMS iShininess;
+layout (set = 1, binding = 8, rgba8_snorm) uniform writeonly restrict image2D oColor;
+
+// -------------------------------------------------------
+
+// ---------------------------
+
+shared uint minDepthInt;
+shared uint maxDepthInt;
+
+
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE, local_size_z = 1) in;
+void main()
+{
+	ivec2 coordinates = ivec2(gl_GlobalInvocationID.xy);
+	vec2 screenSize = vec2(textureSize(iColor));
+	uvec2 tileID = gl_WorkGroupID.xy;
+
+	if (gl_LocalInvocationIndex == 0) {
+		visibleLightCount = 0;
+	}
+	barrier();
+
+	// Depth
+	vec4 depth	= texelFetch(iDepth, coordinates, 0);
+	vec2 ndcCoords = (vec2(coordinates) / vec2(textureSize(iColor))) * 2.0 - 1.0;
+	vec3 ndcPosition = vec3(ndcCoords, depth.r);
+
+	vec4 viewPosition = uboMatricesAndUserInput.mInverseProjMatrix * vec4(ndcPosition, 1.0);
+	viewPosition /= viewPosition.w; // Perform perspective divide
+	vec3 positionVS = viewPosition.xyz;
+
+	uint depthInt = floatBitsToUint(positionVS.z);
+
+	minDepthInt = 0xFFFFFFFF;
+	maxDepthInt = 0;
+
+	barrier();
+	atomicMin(minDepthInt, depthInt);
+	atomicMax(maxDepthInt, depthInt);
+
+	barrier();
+
+	float minGroupDepth = uintBitsToFloat(minDepthInt);
+	float maxGroupDepth = uintBitsToFloat(maxDepthInt);
+
+	barrier();
+
+	vec4 planes[6];
+	compute_tile_frustum_planes(tileID, screenSize, minGroupDepth, maxGroupDepth, planes);
+
+	// Lights
+	uint start = uboLights.mRangesPointSpot[0], end = uboLights.mRangesPointSpot[1];
+//	uint start = uboLights.mRangesAmbientDirectional[0], end = uboLights.mRangesAmbientDirectional[1];
+    uint lightCount = end - start;
+    uint threadCount = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    uint passCount = (lightCount + threadCount - 1) / threadCount;
+    uint groupIndex = gl_LocalInvocationIndex;
+
+    // Initialize visibleLightCount to 0 by the first thread
+    for (uint passIt = 0; passIt < passCount; ++passIt) {
+        uint lightIndex = passIt * threadCount + groupIndex + start;
+        
+        // Clamp lightIndex to avoid accessing out-of-bounds
+        if (lightIndex < lightCount) {
+            // Placeholder for the actual intersection test, currently always true
+            if (intersects(uboLights.mLightData[lightIndex], planes)) {
+                uint offset = atomicAdd(visibleLightCount, 1);
+                visibleLightIndices[offset] = lightIndex;
+            }
+        }
+    }
+    // Synchronize threads
+    barrier();
+
+
+	vec4 finalColor = vec4(0);
+	for (int i = 0; i < 4; ++i) 
+	{
+		vec4 fetchedColor	= texelFetch(iColor, coordinates, i);
+		vec4 depth			= texelFetch(iDepth, coordinates, i);
+		vec3 nsc			= texelFetch(iNormal, coordinates, i).rgb;
+		vec3 ambient		= texelFetch(iAmbient, coordinates, i).rgb;
+		vec3 emissive		= texelFetch(iEmissive, coordinates, i).rgb;
+		vec3 diffuse		= texelFetch(iDiffuse, coordinates, i).rgb;
+		vec3 specular		= texelFetch(iSpecular, coordinates, i).rgb;
+		float shininess		= texelFetch(iShininess, coordinates, i).r;
+
+		vec3 normalVS = vec3(sin(nsc.y)*cos(nsc.x), sin(nsc.y)*sin(nsc.x), cos(nsc).y); 
+
+		vec2 ndcCoords = (vec2(coordinates) / vec2(textureSize(iColor))) * 2.0 - 1.0;
+		vec3 ndcPosition = vec3(ndcCoords, depth.r);
+
+		vec4 viewPosition = uboMatricesAndUserInput.mInverseProjMatrix * vec4(ndcPosition, 1.0);
+		viewPosition /= viewPosition.w; // Perform perspective divide
+		vec3 positionVS = viewPosition.xyz;
+
+		vec3 ambientIllumination = vec3(0.0, 0.0, 0.0);
+		for (uint i = uboLights.mRangesAmbientDirectional[0]; i < uboLights.mRangesAmbientDirectional[1]; ++i) {
+			ambientIllumination += uboLights.mLightData[i].mColor.rgb * ambient;
+		}
+
+		vec3 diffAndSpecIllumination = calc_illumination_in_vs(positionVS, normalVS, diffuse, specular, shininess);
+
+		finalColor += vec4(ambientIllumination + emissive + diffAndSpecIllumination, 1.0);
+	}
+
+	finalColor /= 4; // Manual resolve
+
+	// Test ---------------------------------------------------------------------
+	// Uncomment this code block to see the blocks in tiles around the lights
+
+//	vec3 newcolor = vec3(0.0, 0.0, 0);
+
+//	for (uint i = uboLights.mRangesPointSpot[0]; i < uboLights.mRangesPointSpot[1]; ++i)
+//	{
+//	    LightsourceGpuData light = uboLights.mLightData[i];
+//		vec3 col = light.mColor.rgb;
+//		vec3 atten = light.mAttenuation.rgb;
+//		float radius = estimate_radius_of_influence(col, atten)*0.15;
+//
+//		if (
+//			get_distance_from_plane(light.mPosition.xyz, planes[0]) < radius &&
+//			get_distance_from_plane(light.mPosition.xyz, planes[1]) < radius &&
+//			get_distance_from_plane(light.mPosition.xyz, planes[2]) < radius &&
+//			get_distance_from_plane(light.mPosition.xyz, planes[3]) < radius &&
+//			get_distance_from_plane(light.mPosition.xyz, planes[4]) < radius &&
+//			get_distance_from_plane(light.mPosition.xyz, planes[5])	< radius
+//		 ) 
+//		 {
+//			newcolor+=vec3(0.1,0.0,0.1);
+//		}
+//	}
+//
+//	finalColor += vec4(newcolor, 1.0);
+
+	// ---------------------------------------------------------------------------
+
+	vec3 finalColor_sRGB = linear_to_sRGB(finalColor.bgr);
+	imageStore(oColor, coordinates, vec4(finalColor_sRGB, 1.0));
+
+}
+

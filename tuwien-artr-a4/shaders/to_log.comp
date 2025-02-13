@@ -1,0 +1,31 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform texture2D uColor;
+layout(set = 0, binding = 1, r16f) writeonly uniform restrict image2D uDst0;
+layout(set = 0, binding = 2, r16f) writeonly uniform restrict image2D uDst1;
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+
+// converts linear rgb to luminance
+float rgb2y(vec3 rgb)
+{
+	return dot(vec3(0.2126, 0.7152, 0.0722), rgb);
+}
+
+// ################## compute shader main ###################
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	const float delta = 0.001f;
+	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+	vec3 inp = texelFetch(uColor, pos, 0).rgb;
+	float outp = log(rgb2y(inp) + delta);
+	imageStore(uDst0, pos, vec4(outp, 0.0, 0.0, 0.0));
+	imageStore(uDst1, pos, vec4(outp, 0.0, 0.0, 0.0));
+}
+

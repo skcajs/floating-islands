@@ -1,0 +1,102 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+// ###### SRC/DST IMAGES #################################
+layout(set = 0, binding = 0) uniform sampler uSampler;
+layout(set = 0, binding = 1) uniform texture2D uCurrentFrame;
+layout(set = 0, binding = 2) uniform texture2D uCurrentDepth;
+layout(set = 0, binding = 3) uniform texture2D uHistoryFrame;
+layout(set = 0, binding = 4) uniform texture2D uHistoryDepth;
+layout(set = 0, binding = 5, rgba8) writeonly uniform restrict image2D uResult;
+// -------------------------------------------------------
+
+// ###### PUSH CONSTANTS AND UBOs ########################
+layout(push_constant) uniform PushConstants {
+	vec4 mJitterAndAlpha;
+} pushConstants;
+
+layout(set = 1, binding = 0) uniform Matrices {
+	mat4 mHistoryViewProjMatrix;
+	mat4 mInverseViewProjMatrix;
+} uboMat;
+// -------------------------------------------------------
+
+// ###### HELPER FUNCTIONS ###############################
+
+// Converts sRGB color values into linear space:
+// Apply this after reading colors from textures.
+float sRGB_to_linear(float srgbColor)
+{
+    if (srgbColor <= 0.04045) {
+		return srgbColor / 12.92;
+	}
+    return pow((srgbColor + 0.055) / (1.055), 2.4);
+}
+
+// Converts sRGB color values into linear space:
+// Apply this after reading colors from textures.
+vec3 sRGB_to_linear(vec3 srgbColor)
+{
+	vec3 linear;
+	linear.r = sRGB_to_linear(srgbColor.r);
+	linear.g = sRGB_to_linear(srgbColor.g);
+	linear.b = sRGB_to_linear(srgbColor.b);
+	return linear;
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+float linear_to_sRGB(float linearColor)
+{
+	if (linearColor <= 0.0031308) {
+		return 12.92 * linearColor;
+	}
+	float a = 0.055;
+	return (1 + a) * pow(linearColor, 1 / 2.4) - a;
+}
+
+// Converts color values from linear space into sRGB:
+// Apply this before storing colors in textures.
+vec3 linear_to_sRGB(vec3 linearColor)
+{
+	vec3 srgb;
+	srgb.r = linear_to_sRGB(linearColor.r);
+	srgb.g = linear_to_sRGB(linearColor.g);
+	srgb.b = linear_to_sRGB(linearColor.b);
+	return srgb;
+}
+
+// -------------------------------------------------------
+
+// ################## COMPUTE SHADER MAIN ###################
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main()
+{
+	ivec2 iuv = ivec2(gl_GlobalInvocationID.xy);
+	vec2 uv = (vec2(iuv) + 0.5) / textureSize(uCurrentFrame, 0);
+	
+	// Note: Since Vulkan does not support to use images in sRGB format as storage images, 
+	//       we have to use non-sRGB 8 bit storage images and do gamma correction manually. 
+	//       The following functions are provided for this purpose:
+	//        - sRGB_to_linear ... transforms gamma space into linear color space 
+	//        - linear_to_sRGB ... transforms linear color space into gamma space
+	vec3 currentFrameRgb = sRGB_to_linear(texture(sampler2D(uCurrentFrame, uSampler), uv).rgb);
+
+	//
+	// TODO Task 6: Implement temporal anti-aliasing!
+	// 
+	// Hint: Your solution does not have to use uHistoryDepth.
+	//
+	vec3 antiAliased = currentFrameRgb;
+
+	// Write the RGB color values into the destination image:
+	//  - imageStore() cannot handle sRGB images
+	//  - Therefore, we write sRGB values into an RGB image and copy the image into an sRGB image later as a workaround.
+	// => We have to manually convert linear color space to sRGB color space.
+	vec3 srgb = linear_to_sRGB(antiAliased);
+
+	imageStore(uResult, iuv, vec4(srgb, 1.0));
+}
+// -------------------------------------------------------
+
